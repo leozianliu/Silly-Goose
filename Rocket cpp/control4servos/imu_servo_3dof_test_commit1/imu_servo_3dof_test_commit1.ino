@@ -14,10 +14,11 @@ Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 #define SERVOMAX  600 // Maximum pulse length count (out of 4096)
 #define SERVO_FREQ 50 // Analog servos run at ~50 Hz updates
 
+// 0 fin angles
 const int servo1_iang = 75;
 const int servo2_iang = 80;
-const int servo3_iang = 72;
-const int servo4_iang = 85;
+const int servo3_iang = 72; // adjust
+const int servo4_iang = 85; // adjust
 
 const int servo_angle_max = 70;
 const float servo_ang_to_fin_ang = 0.35;
@@ -26,24 +27,25 @@ struct euler_t {
   float yaw;
   float pitch;
   float roll;
-} ypr;
+};
+
+struct euler_t ypr;
+struct euler_t ypr_dot;
 
 Adafruit_BNO08x  bno08x(BNO08X_RESET);
 sh2_SensorValue_t sensorValue;
 
-#ifdef FAST_MODE
-  // Top frequency is reported to be 1000Hz (but freq is somewhat variable)
-  sh2_SensorId_t reportType = SH2_GYRO_INTEGRATED_RV;
-  long reportIntervalUs = 2000;
-#else
-  // Top frequency is about 250Hz but this report is more accurate
-  sh2_SensorId_t reportType = SH2_ARVR_STABILIZED_RV;
-  long reportIntervalUs = 5000;
-#endif
-void setReports(sh2_SensorId_t reportType, long report_interval) {
+// Top frequency is about 250Hz but this report is more accurate
+long reportIntervalUs = 5000;
+
+
+void setReports(long report_interval) {
   Serial.println("Setting desired reports");
-  if (! bno08x.enableReport(reportType, report_interval)) {
+  if (! bno08x.enableReport(SH2_ARVR_STABILIZED_RV, reportIntervalUs)) {
     Serial.println("Could not enable stabilized remote vector");
+  }
+  if (!bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED)) {
+    Serial.println("Could not enable gyroscope");
   }
 }
 
@@ -61,7 +63,7 @@ void setup(void) {
   }
   Serial.println("BNO08x Found!");
 
-  setReports(reportType, reportIntervalUs);
+  setReports(reportIntervalUs);
 
   Serial.println("Reading events");
   delay(100);
@@ -82,6 +84,10 @@ void quaternionToEuler(float qr, float qi, float qj, float qk, euler_t* ypr, boo
     float sqi = qi * qi;
     float sqj = qj * qj;
     float sqk = qk * qk;
+
+    // ypr->yaw = atan2(2.0 * (qi * qj + qk * qr), (sqi - sqj - sqk + sqr));
+    // ypr->pitch = asin(-2.0 * (qi * qk - qj * qr) / (sqi + sqj + sqk + sqr));
+    // ypr->roll = atan2(2.0 * (qj * qk + qi * qr), (-sqi - sqj + sqk + sqr));
 
     float sin_pitch = -2.0 * (qi * qk - qj * qr) / (sqi + sqj + sqk + sqr);
     if (abs(sin_pitch) >= 1.0) {  // gimbal lock
@@ -142,8 +148,8 @@ float pidControl(float target, float measure, long dt, float kp, float ki, float
   static float error_pre = 0;
   static float error_sum = 0;
   float error = target - measure;
-  float error_dot = (error - error_pre) / (dt * 1e-3);
-  error_sum = error_sum + error * (dt * 1e-3);
+  float error_dot = (error - error_pre) / (dt * 1e-6);
+  error_sum = error_sum + error * (dt * 1e-6);
   error_pre = error; 
   return kp * error + ki * error_sum + kd * error_dot;
 }
@@ -162,57 +168,61 @@ void loop() {
 
   if (bno08x.wasReset()) {
     Serial.print("sensor was reset ");
-    setReports(reportType, reportIntervalUs);
+    setReports(reportIntervalUs);
   }
   
   if (bno08x.getSensorEvent(&sensorValue)) {
     // in this demo only one report type will be received depending on FAST_MODE define (above)
     switch (sensorValue.sensorId) {
       case SH2_ARVR_STABILIZED_RV:
-        quaternionToEulerRV(&sensorValue.un.arvrStabilizedRV, &ypr, true);
+        quaternionToEulerRV(&sensorValue.un.arvrStabilizedRV, &ypr, true); // output in degrees
         break;
-      case SH2_GYRO_INTEGRATED_RV:
-        // faster (more noise?)
-        quaternionToEulerGI(&sensorValue.un.gyroIntegratedRV, &ypr, true);
+      case SH2_GYROSCOPE_CALIBRATED:
+        ypr_dot.roll = sensorValue.un.gyroscope.x * RAD_TO_DEG;
+        ypr_dot.pitch = sensorValue.un.gyroscope.y * RAD_TO_DEG;
+        ypr_dot.yaw = sensorValue.un.gyroscope.z * RAD_TO_DEG;
         break;
-    }
+    }}
+
     static long t_last = 0; // t_pre
     static float x_pitch_pre = 0;
     static float y_roll_pre = 0;
     static float z_yaw_pre = 0;
 
     long t_now = micros();
-    long dt_ms = t_now - t_last;
+    long dt_us = t_now - t_last;
     t_last = t_now;
 
-    Serial.print(dt_ms);             Serial.print("\t");
+    Serial.print(dt_us);             Serial.print("\t");
 
     Serial.print(sensorValue.status);     Serial.print("\t");  // This is accuracy in the range of 0 to 3
     Serial.print(ypr.yaw);                Serial.print("\t");
     Serial.print(ypr.pitch);              Serial.print("\t");
-    Serial.println(ypr.roll);
+    Serial.println(ypr.roll);             Serial.print("\t");
+    Serial.print(ypr_dot.yaw);            Serial.print("\t");
+    Serial.print(ypr_dot.pitch);          Serial.print("\t");
+    Serial.println(ypr_dot.roll);
 
     // in rocket frame, with z up
-    float x_pitch = ypr.yaw;
+    float x_pitch = ypr.roll;
     float y_roll = ypr.pitch;
     float z_yaw = ypr.yaw;
+    float z_yaw_dot = ypr_dot.yaw;
 
-    float z_dot_yaw = (z_yaw - z_yaw_pre) / (dt_ms * 1e-3);
+    float output_z_yaw = pidControl(0, z_yaw_dot, dt_us, 0.1, 0., 0.);
+    float output_y_roll = pidControl(0, y_roll, dt_us, 1., 0., 0.);
+    float output_x_pitch = pidControl(0, x_pitch, dt_us, 1., 0., 0.);
 
-    float output_z_yaw = pidControl(0, z_dot_yaw, dt_ms, 1., 0., 0.);
-    float output_y_roll = pidControl(0, y_roll, dt_ms, 1., 0., 0.);
-    float output_x_pitch = pidControl(0, x_pitch, dt_ms, 1., 0., 0.);
-
-    float fin1_ang = output_z_yaw + 0. + output_x_pitch;
-    float fin2_ang = output_z_yaw + output_y_roll + 0.;
-    float fin3_ang = output_z_yaw + 0. - output_x_pitch;
-    float fin4_ang = output_z_yaw - output_y_roll + 0.;
+    float fin1_ang = (output_z_yaw + 0. + output_x_pitch);
+    float fin2_ang = (output_z_yaw + output_y_roll + 0.);
+    float fin3_ang = (output_z_yaw + 0. - output_x_pitch);
+    float fin4_ang = (output_z_yaw - output_y_roll + 0.);
 
     // raw actuator commands
-    int servo1_ang = (int)(fin1_ang / servo_ang_to_fin_ang);
-    int servo2_ang = (int)(fin2_ang / servo_ang_to_fin_ang);
-    int servo3_ang = (int)(fin3_ang / servo_ang_to_fin_ang);
-    int servo4_ang = (int)(fin4_ang / servo_ang_to_fin_ang);
+    int servo1_ang = (int)(- fin1_ang / servo_ang_to_fin_ang);
+    int servo2_ang = (int)(- fin2_ang / servo_ang_to_fin_ang);
+    int servo3_ang = (int)(- fin3_ang / servo_ang_to_fin_ang);
+    int servo4_ang = (int)(- fin4_ang / servo_ang_to_fin_ang);
 
     // real actuator commands
     int servo1_ang_out = outputSaturation(servo1_ang, servo_angle_max);
@@ -224,7 +234,6 @@ void loop() {
     int servo_angles_out[4] = {servo1_ang_out, servo2_ang_out, servo3_ang_out, servo4_ang_out}; 
     setIdealAngles(servo_angles_out);
 
-    delay(50) // 20Hz
+    delay(50); // 20Hz
   }
 
-}
